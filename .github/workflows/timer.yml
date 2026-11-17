@@ -1,0 +1,220 @@
+name: Radar external timer
+
+# 三层目的：
+#   1) ai-news-radar 是 fork，GitHub 对 fork 的 schedule 限流（实测 24 个整点只命中 1 次）；
+#      本账号的非 fork 仓库 schedule 同样 0 命中——**schedule 只能当装饰，不能当保底**。
+#   2) 一次触发就在 job 内自循环 ~5.3h，结束时派自己一次 → 链式永续。
+#   3) 每拍顺便检查"兄弟定时器"是否还活着，死了就把它拉起来 → 两条独立链互保，
+#      任一条被取消/挂掉/PAT 失效，另一条会在 ≤20min 内补起。
+#
+# 本文件在两个仓库各存一份，只有 SELF_REPO / PEER_REPO 相反。
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # 装饰性兜底：命中就是白赚
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: '循环拍数（默认 16 拍 × 20min ≈ 5.3h；<4 为测试，不接力）'
+        required: false
+        default: '16'
+      sleep_sec:
+        description: '每拍间隔秒数（默认 1200 = 20min；测试可用 90）'
+        required: false
+        default: '1200'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: radar-timer-loop
+  cancel-in-progress: false
+
+env:
+  SELF_REPO: Jackliu-teadrinker/radar-timer-b
+  PEER_REPO: Jackliu-teadrinker/radar-timer
+  RADAR_REPO: Jackliu-teadrinker/ai-news-radar
+
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Watch freshness + peer alive (16 rounds x 20min)
+        id: loop
+        env:
+          RADAR_PAT: ${{ secrets.RADAR_PAT }}
+          ROUNDS_IN: ${{ github.event.inputs.rounds || '16' }}
+          SLEEP_IN: ${{ github.event.inputs.sleep_sec || '1200' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, time, urllib.request, urllib.error
+          from datetime import datetime, timezone
+
+          TOKEN = os.environ.get("RADAR_PAT", "")
+          SELF_REPO = os.environ["SELF_REPO"]
+          PEER_REPO = os.environ["PEER_REPO"]
+          RADAR_REPO = os.environ["RADAR_REPO"]
+          WF = "update-news.yml"
+          STALE_MIN = 22            # 雷达数据超过这个年龄就补一刀
+          RECENT_WINDOW_SEC = 1500  # 25min 内有 run 就不再派（防级联）
+          PEER_ALIVE_SEC = 2100     # 兄弟链 35min 内有过 run 就算活着
+          ROUNDS = int(os.environ.get("ROUNDS_IN") or 16)
+          SLEEP_SEC = int(os.environ.get("SLEEP_IN") or 1200)
+
+          if not TOKEN:
+              print("[FATAL] RADAR_PAT 未配置")
+              sys.exit(1)
+
+          AUTH = {"Authorization": f"token {TOKEN}", "Accept": "application/vnd.github+json",
+                  "User-Agent": "radar-timer/2.0"}
+
+          def get(url, timeout=25, retries=3):
+              last = None
+              for i in range(retries):
+                  try:
+                      req = urllib.request.Request(url, headers={
+                          "User-Agent": "radar-timer/2.0", "Cache-Control": "no-cache"})
+                      return urllib.request.urlopen(req, timeout=timeout).read()
+                  except Exception as e:
+                      last = e
+                      if i < retries - 1:
+                          time.sleep(2 * (i + 1))
+              raise last
+
+          def newest_run(repo, wf=None):
+              u = (f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/runs?per_page=5"
+                   if wf else f"https://api.github.com/repos/{repo}/actions/runs?per_page=5")
+              d = json.loads(urllib.request.urlopen(
+                  urllib.request.Request(u, headers=AUTH), timeout=25).read())
+              runs = d.get("workflow_runs", [])
+              return runs
+
+          def age_min(iso):
+              return (datetime.now(timezone.utc) - datetime.fromisoformat(
+                  iso.replace("Z", "+00:00"))).total_seconds() / 60
+
+          def freshness():
+              age, gen = 9999.0, None
+              for url, label in ((
+                  "https://jackliu-teadrinker.github.io/ai-news-radar/data/days/index.json", "days-index"), (
+                  "https://jackliu-teadrinker.github.io/ai-news-radar/data/latest-24h-min.json", "24h-min")):
+                  try:
+                      d = json.loads(get(url + f"?cb={int(time.time())}"))
+                      g_at = d.get("generated_at")
+                      if not g_at:
+                          continue
+                      a = age_min(g_at)
+                      print(f"[freshness] {label}: generated_at={g_at} age={a:.0f}min")
+                      if a < age:
+                          age, gen = a, g_at
+                  except Exception as e:
+                      print(f"[freshness] {label} failed: {e}")
+              return age, gen
+
+          def dispatch_radar():
+              body = json.dumps({"ref": "master"}).encode()
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{RADAR_REPO}/actions/workflows/{WF}/dispatches",
+                  data=body, method="POST",
+                  headers={**AUTH, "Content-Type": "application/json"})
+              urllib.request.urlopen(req, timeout=25)
+
+          def dispatch_repo(repo, rounds=16, sleep_sec=1200):
+              body = json.dumps({"ref": "main",
+                                 "inputs": {"rounds": str(rounds), "sleep_sec": str(sleep_sec)}}).encode()
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/actions/workflows/timer.yml/dispatches",
+                  data=body, method="POST",
+                  headers={**AUTH, "Content-Type": "application/json"})
+              urllib.request.urlopen(req, timeout=25)
+
+          for rnd in range(1, ROUNDS + 1):
+              print(f"=== round {rnd}/{ROUNDS} {datetime.now(timezone.utc).strftime('%H:%M:%S')}Z")
+
+              # A. 兄弟链存活检查：死了就拉起来（互保核心）
+              try:
+                  peer = newest_run(PEER_REPO)
+                  alive = bool(peer) and (
+                      peer[0]["status"] in ("queued", "in_progress", "waiting")
+                      or age_min(peer[0]["created_at"]) < PEER_ALIVE_SEC / 60)
+                  print(f"[peer] {PEER_REPO}: newest={peer[0]['created_at'] if peer else None} alive={alive}")
+                  if not alive:
+                      print(f"[peer] 兄弟链已停 -> dispatch {PEER_REPO}")
+                      dispatch_repo(PEER_REPO)
+                      print("[peer] resurrected OK")
+              except Exception as e:
+                  print(f"[peer] 检查/拉起失败: {e}")
+
+              # B. 雷达数据新鲜度
+              age, gen = freshness()
+              stale = age > STALE_MIN
+              print(f"[freshness] youngest age={age:.0f}min stale={stale} (threshold {STALE_MIN}min)")
+
+              busy = 0
+              try:
+                  runs = newest_run(RADAR_REPO, WF)[:15]
+                  busy = sum(1 for r in runs
+                             if r["status"] in ("queued", "in_progress", "waiting")
+                             or age_min(r["created_at"]) * 60 < RECENT_WINDOW_SEC)
+              except Exception as e:
+                  print(f"[busy-check] failed (放行): {e}")
+              print(f"[busy-check] active/recent radar runs: {busy}")
+
+              if stale and busy == 0:
+                  print(f"[rescue] stale {age:.0f}min and idle -> dispatch {WF}")
+                  try:
+                      dispatch_radar()
+                      print("[rescue] dispatched OK")
+                  except urllib.error.HTTPError as e:
+                      print(f"[rescue] dispatch FAILED: {e.code} {e.read()[:200]}")
+                  except Exception as e:
+                      print(f"[rescue] dispatch FAILED: {e}")
+              elif stale:
+                  print(f"[rescue] stale but {busy} run(s) active/recent -> skip")
+              else:
+                  print("[rescue] data fresh, nothing to do")
+
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(f"- round {rnd}: age={age:.0f}min stale={stale} busy={busy}\n")
+
+              if rnd < ROUNDS:
+                  time.sleep(SLEEP_SEC)
+          print("[done] loop finished")
+          PY
+
+      - name: Chain next run (self-sustaining)
+        if: always() && steps.loop.outcome == 'success'
+        env:
+          RADAR_PAT: ${{ secrets.RADAR_PAT }}
+          ROUNDS_IN: ${{ github.event.inputs.rounds || '16' }}
+        run: |
+          if [ "${ROUNDS_IN:-16}" -lt 4 ]; then
+            echo "short test run (rounds=$ROUNDS_IN) -> skip chaining"
+            exit 0
+          fi
+          code=$(curl -sS -o /tmp/chain.out -w "%{http_code}" -X POST \
+            -H "Authorization: token $RADAR_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${SELF_REPO}/actions/workflows/timer.yml/dispatches \
+            -d '{"ref":"main"}')
+          echo "chain dispatch: HTTP $code"
+          [ "$code" = "204" ] || exit 1
+
+      - name: Keepalive (avoid 60-day inactivity disable)
+        if: always()
+        run: |
+          last=$(git log -1 --format=%ct -- heartbeat.txt 2>/dev/null || echo 0)
+          now=$(date +%s)
+          if [ $(( now - last )) -gt 604800 ]; then
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
+            git config user.name "radar-timer"
+            git config user.email "radar-timer@users.noreply.github.com"
+            git add heartbeat.txt
+            git commit -m "[timer] heartbeat $(date -u +%F)"
+            git push
+          else
+            echo "heartbeat fresh, skip"
+          fi
