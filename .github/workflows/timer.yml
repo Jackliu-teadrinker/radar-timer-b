@@ -15,13 +15,13 @@ on:
   workflow_dispatch:
     inputs:
       rounds:
-        description: '循环拍数（默认 16 拍 × 20min ≈ 5.3h；<4 为测试，不接力）'
+        description: '循环拍数（B 链默认 32 拍 × 10min ≈ 5.3h，与 A 链 20min 拍交错）'
         required: false
-        default: '16'
+        default: '32'
       sleep_sec:
-        description: '每拍间隔秒数（默认 1200 = 20min；测试可用 90）'
+        description: '每拍间隔秒数（B 链默认 600 = 10min；测试可用 60）'
         required: false
-        default: '1200'
+        default: '600'
 
 permissions:
   contents: write
@@ -46,8 +46,8 @@ jobs:
         id: loop
         env:
           RADAR_PAT: ${{ secrets.RADAR_PAT }}
-          ROUNDS_IN: ${{ github.event.inputs.rounds || '16' }}
-          SLEEP_IN: ${{ github.event.inputs.sleep_sec || '1200' }}
+          ROUNDS_IN: ${{ github.event.inputs.rounds || '32' }}
+          SLEEP_IN: ${{ github.event.inputs.sleep_sec || '600' }}
         run: |
           python3 - <<'PY'
           import json, os, sys, time, urllib.request, urllib.error
@@ -61,8 +61,8 @@ jobs:
           STALE_MIN = 22            # 雷达数据超过这个年龄就补一刀
           RECENT_WINDOW_SEC = 1500  # 25min 内有 run 就不再派（防级联）
           PEER_ALIVE_SEC = 2100     # 兄弟链 35min 内有过 run 就算活着
-          ROUNDS = int(os.environ.get("ROUNDS_IN") or 16)
-          SLEEP_SEC = int(os.environ.get("SLEEP_IN") or 1200)
+          ROUNDS = int(os.environ.get("ROUNDS_IN") or 32)
+          SLEEP_SEC = int(os.environ.get("SLEEP_IN") or 600)
 
           if not TOKEN:
               print("[FATAL] RADAR_PAT 未配置")
@@ -189,9 +189,9 @@ jobs:
         if: always() && steps.loop.outcome == 'success'
         env:
           RADAR_PAT: ${{ secrets.RADAR_PAT }}
-          ROUNDS_IN: ${{ github.event.inputs.rounds || '16' }}
+          ROUNDS_IN: ${{ github.event.inputs.rounds || '32' }}
         run: |
-          if [ "${ROUNDS_IN:-16}" -lt 4 ]; then
+          if [ "${ROUNDS_IN:-32}" -lt 4 ]; then
             echo "short test run (rounds=$ROUNDS_IN) -> skip chaining"
             exit 0
           fi
